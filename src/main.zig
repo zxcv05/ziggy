@@ -3,57 +3,32 @@ const std = @import("std");
 // 128 bytes to handle x86 adjacent-line prefetch (effectively 128-byte coherence unit)
 const cache_line = 128;
 
-const Waiter = struct {
-    mutex: std.Thread.Mutex = .{},
-    cond: std.Thread.Condition = .{},
-    shutdown: bool = false,
-
-    fn wait(self: *Waiter) void {
-        // Spin with yield instead of condvar - avoids futex syscall overhead on Linux
-        for (0..100) |_| {
-            if (self.shutdown) return;
-            std.atomic.spinLoopHint();
-        }
-        std.Thread.yield() catch {};
-    }
-
-    fn notifyOne(self: *Waiter) void {
-        self.cond.signal();
-    }
-
-    fn notifyAll(self: *Waiter) void {
-        self.cond.broadcast();
-    }
-
-    fn close(self: *Waiter) void {
-        self.mutex.lock();
-        self.shutdown = true;
-        self.mutex.unlock();
-        self.cond.broadcast();
-    }
-};
-
 fn RingBuffer(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        // Pad entry to cache line to prevent false sharing between adjacent slots
         const Entry = struct {
-            value: T = undefined,
+            value: T align(cache_line) = undefined,
             version: u64 = 0,
         };
 
         ring: []Entry,
         allocator: std.mem.Allocator,
+        mask: u32, // For fast modulo with power-of-2 sizes
         encoded_version: u64 align(cache_line) = 0,
         consumed_index: u64 align(cache_line) = 0,
-        waiter: Waiter = .{},
+        shutdown: bool align(cache_line) = false,
 
         pub fn init(allocator: std.mem.Allocator, size: u32) !Self {
+            // Ensure power of 2 for fast masking
+            std.debug.assert(size > 0 and (size & (size - 1)) == 0);
             const ring = try allocator.alloc(Entry, size);
             @memset(ring, Entry{});
             return .{
                 .ring = ring,
                 .allocator = allocator,
+                .mask = size - 1,
             };
         }
 
@@ -64,13 +39,13 @@ fn RingBuffer(comptime T: type) type {
 
         pub fn produce(self: *Self, value: T) void {
             const slot = while (true) {
-                const current = @atomicLoad(u64, &self.encoded_version, .acquire);
+                const current = @atomicLoad(u64, &self.encoded_version, .monotonic);
                 const write_idx: u32 = @truncate(current);
                 const version: u32 = @truncate(current >> 32);
 
-                const consumed: u32 = @truncate(@atomicLoad(u64, &self.consumed_index, .acquire));
-                if (write_idx -% consumed >= self.ring.len) {
-                    std.Thread.yield() catch {};
+                const consumed: u32 = @truncate(@atomicLoad(u64, &self.consumed_index, .monotonic));
+                if (write_idx -% consumed > self.mask) {
+                    std.atomic.spinLoopHint();
                     continue;
                 }
 
@@ -83,60 +58,53 @@ fn RingBuffer(comptime T: type) type {
                     &self.encoded_version,
                     current,
                     new_encoded,
-                    .acq_rel,
+                    .acquire,
                     .monotonic,
                 ) == null) {
                     break .{ .idx = write_idx, .ver = new_version };
                 }
             };
 
-            const entry = &self.ring[slot.idx % self.ring.len];
+            const entry = &self.ring[slot.idx & self.mask];
             entry.value = value;
             @atomicStore(u64, &entry.version, slot.ver, .release);
         }
 
-        pub fn notify(self: *Self) void {
-            self.waiter.notifyOne();
-        }
-
-        pub fn notifyAll(self: *Self) void {
-            self.waiter.notifyAll();
-        }
-
         pub fn close(self: *Self) void {
-            self.waiter.close();
+            @atomicStore(bool, &self.shutdown, true, .release);
         }
 
         pub fn tryConsume(self: *Self) ?T {
-            const consumed: u64 = @atomicLoad(u64, &self.consumed_index, .acquire);
-            const consumed_idx: u32 = @truncate(consumed);
-            const write_state = @atomicLoad(u64, &self.encoded_version, .acquire);
-            const write_idx: u32 = @truncate(write_state);
+            while (true) {
+                const consumed: u64 = @atomicLoad(u64, &self.consumed_index, .monotonic);
+                const consumed_idx: u32 = @truncate(consumed);
+                const write_state = @atomicLoad(u64, &self.encoded_version, .monotonic);
+                const write_idx: u32 = @truncate(write_state);
 
-            if (consumed_idx == write_idx) {
-                return null;
-            }
-
-            if (@cmpxchgWeak(
-                u64,
-                &self.consumed_index,
-                consumed,
-                consumed +% 1,
-                .acq_rel,
-                .monotonic,
-            ) == null) {
-                const slot_idx = consumed_idx % @as(u32, @intCast(self.ring.len));
-                const expected_version: u64 = consumed_idx +% 1;
-
-                const entry = &self.ring[slot_idx];
-                while (@atomicLoad(u64, &entry.version, .acquire) < expected_version) {
-                    std.atomic.spinLoopHint();
+                if (consumed_idx == write_idx) {
+                    return null;
                 }
 
-                return entry.value;
-            }
+                if (@cmpxchgWeak(
+                    u64,
+                    &self.consumed_index,
+                    consumed,
+                    consumed +% 1,
+                    .acquire,
+                    .monotonic,
+                ) == null) {
+                    const slot_idx = consumed_idx & self.mask;
+                    const expected_version: u64 = consumed_idx +% 1;
 
-            return null;
+                    const entry = &self.ring[slot_idx];
+                    while (@atomicLoad(u64, &entry.version, .acquire) < expected_version) {
+                        std.atomic.spinLoopHint();
+                    }
+
+                    return entry.value;
+                }
+                // CAS failed, retry immediately
+            }
         }
 
         pub fn consume(self: *Self) ?T {
@@ -145,15 +113,12 @@ fn RingBuffer(comptime T: type) type {
                 return value;
             }
 
-            // Spin briefly (cheaper than futex syscall on Linux)
-            for (0..64) |_| {
-                std.atomic.spinLoopHint();
+            // Spin until data available or shutdown
+            while (!@atomicLoad(bool, &self.shutdown, .acquire)) {
                 if (self.tryConsume()) |value| return value;
-                if (self.waiter.shutdown) return null;
+                std.atomic.spinLoopHint();
             }
 
-            // Slow path - park
-            self.waiter.wait();
             return self.tryConsume();
         }
     };
@@ -164,9 +129,7 @@ pub fn main() !void {
 
     std.debug.print("=== Ring Buffer Benchmark ===\n\n", .{});
 
-    try runBenchmark(allocator, 1, 1, 1_000_000, 256);
-    try runBenchmark(allocator, 4, 4, 1_000_000, 256);
-    try runBenchmark(allocator, 100, 100, 1_000_000, 1024);
+    try runBenchmark(allocator, 20, 20, 1_000_000, 512);
 }
 
 const Ring = RingBuffer(u64);
@@ -182,7 +145,6 @@ fn runBenchmark(
     defer ring.deinit();
 
     var consumed = std.atomic.Value(u32).init(0);
-    var producers_done = std.atomic.Value(u32).init(0);
     const items_per_producer = total_items / num_producers;
     const actual_total = items_per_producer * num_producers;
 
@@ -194,7 +156,7 @@ fn runBenchmark(
     const start = std.time.nanoTimestamp();
 
     for (producer_threads) |*t| {
-        t.* = try std.Thread.spawn(.{}, benchProducer, .{ &ring, items_per_producer, &producers_done, num_producers });
+        t.* = try std.Thread.spawn(.{}, benchProducer, .{ &ring, items_per_producer });
     }
 
     for (consumer_threads) |*t| {
@@ -202,6 +164,7 @@ fn runBenchmark(
     }
 
     for (producer_threads) |t| t.join();
+    ring.close(); // Signal consumers to stop after all producers done
     for (consumer_threads) |t| t.join();
 
     const end = std.time.nanoTimestamp();
@@ -218,30 +181,16 @@ fn runBenchmark(
     });
 }
 
-fn benchProducer(ring: *Ring, count: u32, producers_done: *std.atomic.Value(u32), num_producers: u32) void {
+fn benchProducer(ring: *Ring, count: u32) void {
     for (0..count) |i| {
         ring.produce(i);
-        ring.notify();
-    }
-
-    if (producers_done.fetchAdd(1, .release) + 1 == num_producers) {
-        ring.notifyAll();
     }
 }
 
 fn benchConsumer(ring: *Ring, consumed: *std.atomic.Value(u32), total: u32) void {
-    while (true) {
-        if (consumed.load(.monotonic) >= total) {
-            ring.close();
-            return;
-        }
-
+    while (consumed.load(.monotonic) < total) {
         if (ring.consume()) |_| {
-            if (consumed.fetchAdd(1, .monotonic) + 1 >= total) {
-                ring.close();
-                return;
-            }
-            ring.notify();
+            _ = consumed.fetchAdd(1, .monotonic);
         }
     }
 }
