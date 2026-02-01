@@ -359,10 +359,96 @@ test "multiple producers multiple consumers" {
 test "fuzz mpmc correctness" {
     const base_seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
 
-    // Run 10 iterations with different seeds
-    for (0..10) |i| {
+    // Run 10 iterations with different seeds (use more for stress testing)
+    // Stress test: zig build test -Doptimize=ReleaseFast 2>&1 | grep -c "Fuzz:"
+    const iterations = 10;
+    for (0..iterations) |i| {
         try fuzzTest(std.testing.allocator, base_seed +% i);
     }
+}
+
+test "fuzz with zig fuzzer" {
+    // Run with: zig build test --fuzz
+    try std.testing.fuzz(.{}, fuzzInput, .{ .corpus = &.{} });
+}
+
+fn fuzzInput(_: @TypeOf(.{}), input: []const u8) !void {
+    if (input.len < 4) return;
+
+    // Parse fuzz input into test parameters
+    const ring_size_exp = @as(u5, @intCast((input[0] % 7) + 4)); // 4-10 -> 16 to 1024
+    const ring_size: u32 = @as(u32, 1) << ring_size_exp;
+    const num_producers: u8 = (input[1] % 8) + 1; // 1-8
+    const num_consumers: u8 = (input[2] % 8) + 1; // 1-8
+    const items_per_producer: u32 = (@as(u32, input[3]) * 20) + 10; // 10-5110
+
+    try fuzzTestWithParams(std.testing.allocator, ring_size, num_producers, num_consumers, items_per_producer);
+}
+
+fn fuzzTestWithParams(allocator: std.mem.Allocator, ring_size: u32, num_producers: u8, num_consumers: u8, items_per_producer: u32) !void {
+    const total: usize = @as(usize, num_producers) * items_per_producer;
+
+    var ring = try TestRing.init(allocator, ring_size);
+    defer ring.deinit();
+
+    const consumed_flags = try allocator.alloc(std.atomic.Value(bool), total);
+    defer allocator.free(consumed_flags);
+    for (consumed_flags) |*f| f.* = std.atomic.Value(bool).init(false);
+
+    var consumed_count = std.atomic.Value(usize).init(0);
+    var error_flag = std.atomic.Value(bool).init(false);
+
+    const producers = try allocator.alloc(std.Thread, num_producers);
+    defer allocator.free(producers);
+    const consumers = try allocator.alloc(std.Thread, num_consumers);
+    defer allocator.free(consumers);
+
+    // Start producers
+    for (0..num_producers) |p| {
+        producers[p] = try std.Thread.spawn(.{}, struct {
+            fn run(r: *TestRing, pid: usize, count: u32, ipp: u32) void {
+                for (0..count) |i| {
+                    r.produce(@as(u64, pid) * ipp + @as(u64, @intCast(i)));
+                }
+            }
+        }.run, .{ &ring, p, items_per_producer, items_per_producer });
+    }
+
+    // Start consumers
+    for (0..num_consumers) |c| {
+        consumers[c] = try std.Thread.spawn(.{}, struct {
+            fn run(r: *TestRing, flags: []std.atomic.Value(bool), count: *std.atomic.Value(usize), total_items: usize, err: *std.atomic.Value(bool)) void {
+                while (count.load(.monotonic) < total_items and !err.load(.monotonic)) {
+                    if (r.tryConsume()) |val| {
+                        const idx = @as(usize, @intCast(val));
+                        if (idx >= flags.len) {
+                            err.store(true, .release);
+                            return;
+                        }
+                        if (flags[idx].swap(true, .acq_rel)) {
+                            err.store(true, .release);
+                            return;
+                        }
+                        _ = count.fetchAdd(1, .monotonic);
+                    }
+                }
+            }
+        }.run, .{ &ring, consumed_flags, &consumed_count, total, &error_flag });
+    }
+
+    for (producers) |p| p.join();
+    ring.close();
+    for (consumers) |c| c.join();
+
+    // Check for errors
+    if (error_flag.load(.acquire)) return error.FuzzError;
+
+    // Verify all consumed
+    for (consumed_flags) |f| {
+        if (!f.load(.acquire)) return error.FuzzError;
+    }
+
+    if (consumed_count.load(.acquire) != total) return error.FuzzError;
 }
 
 fn fuzzTest(allocator: std.mem.Allocator, seed: u64) !void {
