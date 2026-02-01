@@ -44,7 +44,7 @@ zig build run -Doptimize=ReleaseFast  # run benchmarks
 
 ![latency](benchmarks/latency.png)
 
-![throughput](benchmarks/throughput.png)
+<img src="benchmarks/throughput.png" width="50%">
 
 crossbeam wins on median latency, ziggy is competitive on throughput and p99.9.
 
