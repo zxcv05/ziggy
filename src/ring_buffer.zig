@@ -3,47 +3,38 @@ const builtin = @import("builtin");
 
 pub const cache_line = 128;
 
-/// Waiter for parking threads when queue is empty/full.
-/// Uses parked_count for fast-path: skip syscall when no one is waiting.
-pub const Waiter = struct {
+const Waiter = struct {
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
     parked_count: u32 align(cache_line) = 0,
     shutdown: bool = false,
 
-    /// Park the calling thread until notified or shutdown
-    pub fn wait(self: *Waiter) void {
+    fn wait(self: *Waiter) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-
         _ = @atomicRmw(u32, &self.parked_count, .Add, 1, .monotonic);
         defer _ = @atomicRmw(u32, &self.parked_count, .Sub, 1, .monotonic);
-
         while (!self.shutdown) {
             self.cond.wait(&self.mutex);
-            break; // Woken up
+            break;
         }
     }
 
-    /// Wake one parked thread (if any)
-    pub fn notifyOne(self: *Waiter) void {
-        // Fast path: no one waiting, skip the signal entirely
+    fn notifyOne(self: *Waiter) void {
         if (@atomicLoad(u32, &self.parked_count, .monotonic) != 0) {
-            @branchHint(.cold); // Rarely have parked waiters in hot path
+            @branchHint(.cold);
             self.cond.signal();
         }
     }
 
-    /// Wake all parked threads
-    pub fn notifyAll(self: *Waiter) void {
+    fn notifyAll(self: *Waiter) void {
         if (@atomicLoad(u32, &self.parked_count, .monotonic) != 0) {
             @branchHint(.cold);
             self.cond.broadcast();
         }
     }
 
-    /// Signal shutdown and wake everyone
-    pub fn close(self: *Waiter) void {
+    fn close(self: *Waiter) void {
         self.mutex.lock();
         self.shutdown = true;
         self.mutex.unlock();
@@ -51,18 +42,10 @@ pub const Waiter = struct {
     }
 };
 
-/// Thread-safe MPMC ring buffer using sequence-per-slot design.
-///
-/// Invariants:
-/// 1. head >= tail (can't consume more than produced)
-/// 2. head - tail <= size (can't exceed capacity)
-/// 3. Each item consumed exactly once
-/// 4. Each slot written only when free
-/// 5. Consumer reads only after producer writes
+/// MPMC ring buffer (sequence-per-slot design)
 pub fn RingBuffer(comptime T: type) type {
     return struct {
         const Self = @This();
-
         const Slot = struct {
             sequence: u64 align(cache_line) = 0,
             value: T = undefined,
@@ -76,7 +59,6 @@ pub fn RingBuffer(comptime T: type) type {
         consumer_waiter: Waiter align(cache_line) = .{},
         allocator: std.mem.Allocator,
 
-        // Debug counters (only in debug builds)
         produced: if (builtin.mode == .Debug) std.atomic.Value(u64) else void =
             if (builtin.mode == .Debug) std.atomic.Value(u64).init(0) else {},
         consumed: if (builtin.mode == .Debug) std.atomic.Value(u64) else void =
@@ -111,28 +93,22 @@ pub fn RingBuffer(comptime T: type) type {
                 const seq = @atomicLoad(u64, &slot.sequence, .acquire);
 
                 if (seq == head) {
-                    @branchHint(.likely); // Slot ready is the common case
+                    @branchHint(.likely);
                     if (@cmpxchgWeak(u64, &self.head, head, head +% 1, .monotonic, .monotonic) == null) {
-                        @branchHint(.likely); // CAS success is common
+                        @branchHint(.likely);
                         slot.value = value;
                         @atomicStore(u64, &slot.sequence, head +% 1, .release);
-
-                        if (builtin.mode == .Debug) {
-                            _ = self.produced.fetchAdd(1, .monotonic);
-                        }
-
+                        if (builtin.mode == .Debug) _ = self.produced.fetchAdd(1, .monotonic);
                         self.consumer_waiter.notifyOne();
                         return;
                     }
-                    // CAS failed - another producer won, retry immediately
                     continue;
                 }
 
-                // Slot not ready (full or stale read) - unified backoff
                 std.atomic.spinLoopHint();
                 spin_count +%= 1;
                 if (spin_count == 0) {
-                    @branchHint(.cold); // Yield is rare (every 256 spins)
+                    @branchHint(.cold);
                     std.Thread.yield() catch {};
                 }
             }
@@ -150,88 +126,59 @@ pub fn RingBuffer(comptime T: type) type {
             const expected = tail +% 1;
 
             if (seq == expected) {
-                @branchHint(.likely); // Data ready is common when called
+                @branchHint(.likely);
                 if (@cmpxchgWeak(u64, &self.tail, tail, expected, .monotonic, .monotonic) == null) {
-                    @branchHint(.likely); // CAS success is common
+                    @branchHint(.likely);
                     const value = slot.value;
                     @atomicStore(u64, &slot.sequence, tail +% self.mask +% 1, .release);
-
-                    if (builtin.mode == .Debug) {
-                        _ = self.consumed.fetchAdd(1, .monotonic);
-                    }
+                    if (builtin.mode == .Debug) _ = self.consumed.fetchAdd(1, .monotonic);
                     return value;
                 }
             }
             return null;
         }
 
-        /// Blocking consume - spins briefly, then parks if no data
         pub fn consume(self: *Self) ?T {
-            // Fast path - most calls succeed here
             if (self.tryConsume()) |v| {
                 @branchHint(.likely);
                 return v;
             }
 
-            // Spin briefly - message might be arriving
             var spin_count: u8 = 0;
             while (spin_count < 16) : (spin_count += 1) {
                 if (self.tryConsume()) |v| return v;
                 if (@atomicLoad(bool, &self.shutdown, .acquire)) {
-                    @branchHint(.cold); // Shutdown is rare
+                    @branchHint(.cold);
                     return self.tryConsume();
                 }
                 std.atomic.spinLoopHint();
             }
 
-            // Nothing coming - park instead of burning CPU
             while (!@atomicLoad(bool, &self.shutdown, .acquire)) {
                 self.consumer_waiter.wait();
                 if (self.tryConsume()) |v| return v;
             }
-
             return self.tryConsume();
         }
 
-        /// Debug: check invariants hold
         pub fn checkInvariants(self: *Self) void {
             if (builtin.mode != .Debug) return;
-
             const head = @atomicLoad(u64, &self.head, .acquire);
             const tail = @atomicLoad(u64, &self.tail, .acquire);
-            const produced_count = self.produced.load(.acquire);
-            const consumed_count = self.consumed.load(.acquire);
-
-            // head >= tail (in modular arithmetic, check via size)
-            const in_flight = head -% tail;
-            std.debug.assert(in_flight <= self.mask + 1); // Can't have more than ring size
-
-            // produced == head, consumed == tail
-            std.debug.assert(produced_count == head);
-            std.debug.assert(consumed_count == tail);
+            std.debug.assert(head -% tail <= self.mask + 1);
+            std.debug.assert(self.produced.load(.acquire) == head);
+            std.debug.assert(self.consumed.load(.acquire) == tail);
         }
     };
 }
 
-// ============================================================================
-// TESTS
-// ============================================================================
+// Tests
 
-/// Unique value for testing: encodes producer ID and sequence number
 const TestValue = struct {
     producer_id: u32,
     seq: u32,
-
-    fn encode(producer_id: u32, seq: u32) u64 {
-        return (@as(u64, producer_id) << 32) | seq;
-    }
-
-    fn decode(val: u64) TestValue {
-        return .{
-            .producer_id = @intCast(val >> 32),
-            .seq = @intCast(val & 0xFFFFFFFF),
-        };
-    }
+    fn encode(producer_id: u32, seq: u32) u64 { return (@as(u64, producer_id) << 32) | seq; }
+    fn decode(val: u64) TestValue { return .{ .producer_id = @intCast(val >> 32), .seq = @intCast(val & 0xFFFFFFFF) }; }
 };
 
 const TestRing = RingBuffer(u64);
@@ -391,9 +338,7 @@ test "multiple producers multiple consumers" {
     try std.testing.expectEqual(total, consumed_count.load(.acquire));
 }
 
-// ============================================================================
-// FUZZ TEST
-// ============================================================================
+// Fuzz tests
 
 test "fuzz mpmc correctness" {
     const base_seed = @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp()))));
