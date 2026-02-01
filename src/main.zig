@@ -5,19 +5,15 @@ const cache_line = 64;
 const Waiter = struct {
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
-    parked_count: u32 = 0,
     shutdown: bool = false,
 
     fn wait(self: *Waiter) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-
-        self.parked_count += 1;
         while (!self.shutdown) {
-            self.cond.timedWait(&self.mutex, 1_000_000) catch break;
+            self.cond.timedWait(&self.mutex, 1_000_000) catch break; // 1ms
             break;
         }
-        self.parked_count -= 1;
     }
 
     fn notifyOne(self: *Waiter) void {
