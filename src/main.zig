@@ -3,14 +3,62 @@ const builtin = @import("builtin");
 
 const cache_line = 128;
 
+/// Waiter for parking threads when queue is empty/full.
+/// Uses parked_count for fast-path: skip syscall when no one is waiting.
+const Waiter = struct {
+    mutex: std.Thread.Mutex = .{},
+    cond: std.Thread.Condition = .{},
+    parked_count: u32 align(cache_line) = 0,
+    shutdown: bool = false,
+
+    /// Park the calling thread until notified or shutdown
+    fn wait(self: *Waiter) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        _ = @atomicRmw(u32, &self.parked_count, .Add, 1, .monotonic);
+        defer _ = @atomicRmw(u32, &self.parked_count, .Sub, 1, .monotonic);
+
+        while (!self.shutdown) {
+            self.cond.wait(&self.mutex);
+            break; // Woken up
+        }
+    }
+
+    /// Wake one parked thread (if any)
+    fn notifyOne(self: *Waiter) void {
+        // Fast path: no one waiting, skip the signal entirely
+        if (@atomicLoad(u32, &self.parked_count, .monotonic) == 0) {
+            return;
+        }
+        self.cond.signal();
+    }
+
+    /// Wake all parked threads
+    fn notifyAll(self: *Waiter) void {
+        if (@atomicLoad(u32, &self.parked_count, .monotonic) == 0) {
+            return;
+        }
+        self.cond.broadcast();
+    }
+
+    /// Signal shutdown and wake everyone
+    fn close(self: *Waiter) void {
+        self.mutex.lock();
+        self.shutdown = true;
+        self.mutex.unlock();
+        self.cond.broadcast();
+    }
+};
+
 /// Thread-safe MPMC ring buffer using sequence-per-slot design.
 ///
-/// Invariants that must hold:
-/// 1. head >= tail (can't consume more than produced) - checked via sequence
-/// 2. head - tail <= size (can't exceed capacity) - enforced by blocking
-/// 3. Each item consumed exactly once - enforced by CAS on tail
-/// 4. Each slot written only when free - enforced by sequence check
-/// 5. Consumer only reads after producer writes - enforced by sequence
+/// Invariants:
+/// 1. head >= tail (can't consume more than produced)
+/// 2. head - tail <= size (can't exceed capacity)
+/// 3. Each item consumed exactly once
+/// 4. Each slot written only when free
+/// 5. Consumer reads only after producer writes
 fn RingBuffer(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -25,6 +73,7 @@ fn RingBuffer(comptime T: type) type {
         head: u64 align(cache_line) = 0,
         tail: u64 align(cache_line) = 0,
         shutdown: bool align(cache_line) = false,
+        consumer_waiter: Waiter align(cache_line) = .{},
         allocator: std.mem.Allocator,
 
         // Debug counters (only in debug builds)
@@ -34,12 +83,9 @@ fn RingBuffer(comptime T: type) type {
             if (builtin.mode == .Debug) std.atomic.Value(u64).init(0) else {},
 
         pub fn init(allocator: std.mem.Allocator, size: u32) !Self {
-            // Must be power of 2 for mask to work
             std.debug.assert(size > 0 and (size & (size - 1)) == 0);
 
             const slots = try allocator.alloc(Slot, size);
-
-            // Initialize sequence numbers: slot[i].seq = i means "ready for item i"
             for (slots, 0..) |*slot, i| {
                 slot.sequence = i;
                 slot.value = undefined;
@@ -68,41 +114,36 @@ fn RingBuffer(comptime T: type) type {
                 const diff = @as(i64, @bitCast(seq)) - @as(i64, @bitCast(head));
 
                 if (diff == 0) {
-                    // Slot is ready for writing (seq == head)
                     if (@cmpxchgWeak(u64, &self.head, head, head +% 1, .monotonic, .monotonic) == null) {
-                        // INVARIANT: We own this slot exclusively now
-                        // The sequence number equaled head, meaning it was free
-
                         slot.value = value;
-
-                        // Publish: set seq = head + 1 to signal "data ready"
-                        // INVARIANT: Consumer will see seq == tail + 1
                         @atomicStore(u64, &slot.sequence, head +% 1, .release);
 
                         if (builtin.mode == .Debug) {
                             _ = self.produced.fetchAdd(1, .monotonic);
                         }
+
+                        // Wake one sleeping consumer (if any)
+                        self.consumer_waiter.notifyOne();
                         return;
                     }
                     spin_count = 0;
                 } else if (diff < 0) {
-                    // Buffer full (consumer hasn't freed this slot yet)
-                    // INVARIANT: diff < 0 means seq < head, slot still in use
-                    if (spin_count < 8) {
+                    // Buffer full - producers spin (consumers will catch up)
+                    if (spin_count < 16) {
                         std.atomic.spinLoopHint();
                         spin_count += 1;
                     } else {
-                        const extra = @min(spin_count - 7, 5);
-                        for (0..(@as(u8, 1) << extra)) |_| std.atomic.spinLoopHint();
-                        spin_count +|= 1;
+                        // Yield to let consumers run
+                        std.Thread.yield() catch {};
+                        spin_count = 8;
                     }
                 }
-                // diff > 0: Another producer is writing, CAS will fail, retry
             }
         }
 
         pub fn close(self: *Self) void {
             @atomicStore(bool, &self.shutdown, true, .release);
+            self.consumer_waiter.close();
         }
 
         pub fn tryConsume(self: *Self) ?T {
@@ -114,13 +155,8 @@ fn RingBuffer(comptime T: type) type {
             const diff = @as(i64, @bitCast(seq)) - @as(i64, @bitCast(tail +% 1));
 
             if (diff == 0) {
-                // Data is ready (seq == tail + 1, set by producer)
                 if (@cmpxchgWeak(u64, &self.tail, tail, tail +% 1, .monotonic, .monotonic) == null) {
-                    // INVARIANT: We own this slot exclusively now
                     const value = slot.value;
-
-                    // Free slot: set seq = tail + size to mark "ready for next cycle"
-                    // Next producer will see seq == head when head wraps around
                     @atomicStore(u64, &slot.sequence, tail +% self.mask +% 1, .release);
 
                     if (builtin.mode == .Debug) {
@@ -129,28 +165,33 @@ fn RingBuffer(comptime T: type) type {
                     return value;
                 }
             }
-            // diff < 0: No data yet (producer hasn't written)
-            // diff > 0: Another consumer already took this and slot moved to next cycle
-            //           (our tail read was stale - CAS would fail anyway)
             return null;
         }
 
+        /// Blocking consume - spins briefly, then parks if no data
         pub fn consume(self: *Self) ?T {
+            // Fast path
             if (self.tryConsume()) |v| return v;
 
+            // Spin briefly - message might be arriving
             var spin_count: u8 = 0;
-            while (!@atomicLoad(bool, &self.shutdown, .acquire)) {
+            while (spin_count < 16) {
                 if (self.tryConsume()) |v| return v;
-
-                if (spin_count < 8) {
-                    std.atomic.spinLoopHint();
-                    spin_count += 1;
-                } else {
-                    const extra = @min(spin_count - 7, 5);
-                    for (0..(@as(u8, 1) << extra)) |_| std.atomic.spinLoopHint();
-                    spin_count +|= 1;
+                if (@atomicLoad(bool, &self.shutdown, .acquire)) {
+                    return self.tryConsume();
                 }
+                std.atomic.spinLoopHint();
+                spin_count += 1;
             }
+
+            // Nothing coming - park instead of burning CPU
+            while (!@atomicLoad(bool, &self.shutdown, .acquire)) {
+                self.consumer_waiter.wait();
+
+                // Woke up - try again
+                if (self.tryConsume()) |v| return v;
+            }
+
             return self.tryConsume();
         }
 
