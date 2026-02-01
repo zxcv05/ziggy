@@ -1,73 +1,67 @@
 const std = @import("std");
 
-// 128 bytes to handle x86 adjacent-line prefetch (effectively 128-byte coherence unit)
 const cache_line = 128;
 
 fn RingBuffer(comptime T: type) type {
     return struct {
         const Self = @This();
 
-        // Pad entry to cache line to prevent false sharing between adjacent slots
-        const Entry = struct {
-            value: T align(cache_line) = undefined,
-            version: u64 = 0,
+        // Each slot has its own sequence number - reduces global contention
+        const Slot = struct {
+            sequence: u64 align(cache_line) = 0,
+            value: T = undefined,
         };
 
-        ring: []Entry,
-        allocator: std.mem.Allocator,
-        mask: u32, // For fast modulo with power-of-2 sizes
-        encoded_version: u64 align(cache_line) = 0,
-        consumed_index: u64 align(cache_line) = 0,
+        slots: []Slot,
+        mask: u64,
+        head: u64 align(cache_line) = 0,
+        tail: u64 align(cache_line) = 0,
         shutdown: bool align(cache_line) = false,
+        allocator: std.mem.Allocator,
 
         pub fn init(allocator: std.mem.Allocator, size: u32) !Self {
-            // Ensure power of 2 for fast masking
             std.debug.assert(size > 0 and (size & (size - 1)) == 0);
-            const ring = try allocator.alloc(Entry, size);
-            @memset(ring, Entry{});
+            const slots = try allocator.alloc(Slot, size);
+            for (slots, 0..) |*slot, i| {
+                slot.sequence = i;
+                slot.value = undefined;
+            }
             return .{
-                .ring = ring,
-                .allocator = allocator,
+                .slots = slots,
                 .mask = size - 1,
+                .allocator = allocator,
             };
         }
 
         pub fn deinit(self: *Self) void {
-            self.allocator.free(self.ring);
+            self.allocator.free(self.slots);
             self.* = undefined;
         }
 
         pub fn produce(self: *Self, value: T) void {
-            const slot = while (true) {
-                const current = @atomicLoad(u64, &self.encoded_version, .monotonic);
-                const write_idx: u32 = @truncate(current);
-                const version: u32 = @truncate(current >> 32);
+            var backoff: u8 = 0;
+            while (true) {
+                const head = @atomicLoad(u64, &self.head, .monotonic);
+                const slot = &self.slots[head & self.mask];
 
-                const consumed: u32 = @truncate(@atomicLoad(u64, &self.consumed_index, .monotonic));
-                if (write_idx -% consumed > self.mask) {
-                    std.atomic.spinLoopHint();
-                    continue;
+                const seq = @atomicLoad(u64, &slot.sequence, .acquire);
+                const diff = @as(i64, @bitCast(seq)) - @as(i64, @bitCast(head));
+
+                if (diff == 0) {
+                    if (@cmpxchgWeak(u64, &self.head, head, head +% 1, .monotonic, .monotonic) == null) {
+                        slot.value = value;
+                        @atomicStore(u64, &slot.sequence, head +% 1, .release);
+                        return;
+                    }
+                } else if (diff < 0) {
+                    if (backoff < 6) {
+                        for (0..(@as(u32, 1) << @as(u5, @intCast(backoff)))) |_| std.atomic.spinLoopHint();
+                        backoff += 1;
+                    } else {
+                        std.atomic.spinLoopHint();
+                    }
                 }
-
-                const new_idx = write_idx +% 1;
-                const new_version = version +% 1;
-                const new_encoded = @as(u64, new_idx) | (@as(u64, new_version) << 32);
-
-                if (@cmpxchgWeak(
-                    u64,
-                    &self.encoded_version,
-                    current,
-                    new_encoded,
-                    .acquire,
-                    .monotonic,
-                ) == null) {
-                    break .{ .idx = write_idx, .ver = new_version };
-                }
-            };
-
-            const entry = &self.ring[slot.idx & self.mask];
-            entry.value = value;
-            @atomicStore(u64, &entry.version, slot.ver, .release);
+            }
         }
 
         pub fn close(self: *Self) void {
@@ -75,50 +69,37 @@ fn RingBuffer(comptime T: type) type {
         }
 
         pub fn tryConsume(self: *Self) ?T {
-            while (true) {
-                const consumed: u64 = @atomicLoad(u64, &self.consumed_index, .monotonic);
-                const consumed_idx: u32 = @truncate(consumed);
-                const write_state = @atomicLoad(u64, &self.encoded_version, .monotonic);
-                const write_idx: u32 = @truncate(write_state);
+            const tail = @atomicLoad(u64, &self.tail, .monotonic);
+            const slot = &self.slots[tail & self.mask];
 
-                if (consumed_idx == write_idx) {
-                    return null;
+            const seq = @atomicLoad(u64, &slot.sequence, .acquire);
+            const diff = @as(i64, @bitCast(seq)) - @as(i64, @bitCast(tail +% 1));
+
+            if (diff == 0) {
+                if (@cmpxchgWeak(u64, &self.tail, tail, tail +% 1, .monotonic, .monotonic) == null) {
+                    const value = slot.value;
+                    @atomicStore(u64, &slot.sequence, tail +% self.mask +% 1, .release);
+                    return value;
                 }
-
-                if (@cmpxchgWeak(
-                    u64,
-                    &self.consumed_index,
-                    consumed,
-                    consumed +% 1,
-                    .acquire,
-                    .monotonic,
-                ) == null) {
-                    const slot_idx = consumed_idx & self.mask;
-                    const expected_version: u64 = consumed_idx +% 1;
-
-                    const entry = &self.ring[slot_idx];
-                    while (@atomicLoad(u64, &entry.version, .acquire) < expected_version) {
-                        std.atomic.spinLoopHint();
-                    }
-
-                    return entry.value;
-                }
-                // CAS failed, retry immediately
             }
+            return null;
         }
 
         pub fn consume(self: *Self) ?T {
-            // Fast path - try immediately
-            if (self.tryConsume()) |value| {
-                return value;
-            }
+            if (self.tryConsume()) |v| return v;
 
-            // Spin until data available or shutdown
+            var backoff: u8 = 0;
             while (!@atomicLoad(bool, &self.shutdown, .acquire)) {
-                if (self.tryConsume()) |value| return value;
-                std.atomic.spinLoopHint();
-            }
+                if (self.tryConsume()) |v| return v;
 
+                if (backoff < 6) {
+                    for (0..(@as(u32, 1) << @as(u5, @intCast(backoff)))) |_| std.atomic.spinLoopHint();
+                    backoff += 1;
+                } else {
+                    std.atomic.spinLoopHint();
+                    backoff = 4;
+                }
+            }
             return self.tryConsume();
         }
     };
@@ -126,10 +107,11 @@ fn RingBuffer(comptime T: type) type {
 
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
-
     std.debug.print("=== Ring Buffer Benchmark ===\n\n", .{});
-
+    try runBenchmark(allocator, 1, 1, 1_000_000, 256);
+    try runBenchmark(allocator, 4, 4, 1_000_000, 256);
     try runBenchmark(allocator, 20, 20, 1_000_000, 512);
+    try runBenchmark(allocator, 100, 100, 1_000_000, 1024);
 }
 
 const Ring = RingBuffer(u64);
@@ -164,7 +146,7 @@ fn runBenchmark(
     }
 
     for (producer_threads) |t| t.join();
-    ring.close(); // Signal consumers to stop after all producers done
+    ring.close();
     for (consumer_threads) |t| t.join();
 
     const end = std.time.nanoTimestamp();
@@ -173,11 +155,7 @@ fn runBenchmark(
     const ops_per_sec = if (elapsed_ns > 0) (@as(u64, actual_total) * 1_000_000_000) / elapsed_ns else 0;
 
     std.debug.print("{d}P/{d}C: {d} items in {d}ms = {d} ops/sec\n", .{
-        num_producers,
-        num_consumers,
-        actual_total,
-        elapsed_ms,
-        ops_per_sec,
+        num_producers, num_consumers, actual_total, elapsed_ms, ops_per_sec,
     });
 }
 
