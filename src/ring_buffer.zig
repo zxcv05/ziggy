@@ -28,18 +28,18 @@ pub const Waiter = struct {
     /// Wake one parked thread (if any)
     pub fn notifyOne(self: *Waiter) void {
         // Fast path: no one waiting, skip the signal entirely
-        if (@atomicLoad(u32, &self.parked_count, .monotonic) == 0) {
-            return;
+        if (@atomicLoad(u32, &self.parked_count, .monotonic) != 0) {
+            @branchHint(.cold); // Rarely have parked waiters in hot path
+            self.cond.signal();
         }
-        self.cond.signal();
     }
 
     /// Wake all parked threads
     pub fn notifyAll(self: *Waiter) void {
-        if (@atomicLoad(u32, &self.parked_count, .monotonic) == 0) {
-            return;
+        if (@atomicLoad(u32, &self.parked_count, .monotonic) != 0) {
+            @branchHint(.cold);
+            self.cond.broadcast();
         }
-        self.cond.broadcast();
     }
 
     /// Signal shutdown and wake everyone
@@ -107,14 +107,13 @@ pub fn RingBuffer(comptime T: type) type {
             var spin_count: u8 = 0;
             while (true) {
                 const head = @atomicLoad(u64, &self.head, .monotonic);
-                const slot_idx = head & self.mask;
-                const slot = &self.slots[slot_idx];
-
+                const slot = &self.slots[head & self.mask];
                 const seq = @atomicLoad(u64, &slot.sequence, .acquire);
-                const diff = @as(i64, @bitCast(seq)) - @as(i64, @bitCast(head));
 
-                if (diff == 0) {
+                if (seq == head) {
+                    @branchHint(.likely); // Slot ready is the common case
                     if (@cmpxchgWeak(u64, &self.head, head, head +% 1, .monotonic, .monotonic) == null) {
+                        @branchHint(.likely); // CAS success is common
                         slot.value = value;
                         @atomicStore(u64, &slot.sequence, head +% 1, .release);
 
@@ -122,21 +121,19 @@ pub fn RingBuffer(comptime T: type) type {
                             _ = self.produced.fetchAdd(1, .monotonic);
                         }
 
-                        // Wake one sleeping consumer (if any)
                         self.consumer_waiter.notifyOne();
                         return;
                     }
-                    spin_count = 0;
-                } else if (diff < 0) {
-                    // Buffer full - producers spin (consumers will catch up)
-                    if (spin_count < 16) {
-                        std.atomic.spinLoopHint();
-                        spin_count += 1;
-                    } else {
-                        // Yield to let consumers run
-                        std.Thread.yield() catch {};
-                        spin_count = 8;
-                    }
+                    // CAS failed - another producer won, retry immediately
+                    continue;
+                }
+
+                // Slot not ready (full or stale read) - unified backoff
+                std.atomic.spinLoopHint();
+                spin_count +%= 1;
+                if (spin_count == 0) {
+                    @branchHint(.cold); // Yield is rare (every 256 spins)
+                    std.Thread.yield() catch {};
                 }
             }
         }
@@ -148,14 +145,14 @@ pub fn RingBuffer(comptime T: type) type {
 
         pub fn tryConsume(self: *Self) ?T {
             const tail = @atomicLoad(u64, &self.tail, .monotonic);
-            const slot_idx = tail & self.mask;
-            const slot = &self.slots[slot_idx];
-
+            const slot = &self.slots[tail & self.mask];
             const seq = @atomicLoad(u64, &slot.sequence, .acquire);
-            const diff = @as(i64, @bitCast(seq)) - @as(i64, @bitCast(tail +% 1));
+            const expected = tail +% 1;
 
-            if (diff == 0) {
-                if (@cmpxchgWeak(u64, &self.tail, tail, tail +% 1, .monotonic, .monotonic) == null) {
+            if (seq == expected) {
+                @branchHint(.likely); // Data ready is common when called
+                if (@cmpxchgWeak(u64, &self.tail, tail, expected, .monotonic, .monotonic) == null) {
+                    @branchHint(.likely); // CAS success is common
                     const value = slot.value;
                     @atomicStore(u64, &slot.sequence, tail +% self.mask +% 1, .release);
 
@@ -170,25 +167,26 @@ pub fn RingBuffer(comptime T: type) type {
 
         /// Blocking consume - spins briefly, then parks if no data
         pub fn consume(self: *Self) ?T {
-            // Fast path
-            if (self.tryConsume()) |v| return v;
+            // Fast path - most calls succeed here
+            if (self.tryConsume()) |v| {
+                @branchHint(.likely);
+                return v;
+            }
 
             // Spin briefly - message might be arriving
             var spin_count: u8 = 0;
-            while (spin_count < 16) {
+            while (spin_count < 16) : (spin_count += 1) {
                 if (self.tryConsume()) |v| return v;
                 if (@atomicLoad(bool, &self.shutdown, .acquire)) {
+                    @branchHint(.cold); // Shutdown is rare
                     return self.tryConsume();
                 }
                 std.atomic.spinLoopHint();
-                spin_count += 1;
             }
 
             // Nothing coming - park instead of burning CPU
             while (!@atomicLoad(bool, &self.shutdown, .acquire)) {
                 self.consumer_waiter.wait();
-
-                // Woke up - try again
                 if (self.tryConsume()) |v| return v;
             }
 
