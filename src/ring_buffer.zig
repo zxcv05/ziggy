@@ -3,27 +3,10 @@ const builtin = @import("builtin");
 
 pub const cache_line = 128;
 
-// Waiter provides a parking mechanism for idle consumers.
-// Instead of spinning forever when the buffer is empty, consumers can park here
-// and get woken up when a producer adds an item. Uses a mutex+condvar internally
-// but the fast path (checking parked_count) is lock-free. The shutdown flag
-// allows clean termination - once set, all waiters wake up and exit.
 const Waiter = struct {
     mutex: std.Thread.Mutex = .{},
     cond: std.Thread.Condition = .{},
     parked_count: u32 align(cache_line) = 0,
-    shutdown: bool = false,
-
-    fn wait(self: *Waiter) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        _ = @atomicRmw(u32, &self.parked_count, .Add, 1, .monotonic);
-        defer _ = @atomicRmw(u32, &self.parked_count, .Sub, 1, .monotonic);
-        while (!self.shutdown) {
-            self.cond.wait(&self.mutex);
-            break;
-        }
-    }
 
     fn notifyOne(self: *Waiter) void {
         if (@atomicLoad(u32, &self.parked_count, .monotonic) != 0) {
@@ -32,18 +15,11 @@ const Waiter = struct {
         }
     }
 
-    fn notifyAll(self: *Waiter) void {
+    fn broadcast(self: *Waiter) void {
         if (@atomicLoad(u32, &self.parked_count, .monotonic) != 0) {
             @branchHint(.cold);
             self.cond.broadcast();
         }
-    }
-
-    fn close(self: *Waiter) void {
-        self.mutex.lock();
-        self.shutdown = true;
-        self.mutex.unlock();
-        self.cond.broadcast();
     }
 };
 
@@ -76,8 +52,9 @@ pub fn RingBuffer(comptime T: type) type {
         mask: u64,
         head: u64 align(cache_line) = 0,
         tail: u64 align(cache_line) = 0,
+        epoch: u64 align(cache_line) = 0,
         shutdown: bool align(cache_line) = false,
-        consumer_waiter: Waiter align(cache_line) = .{},
+        waiter: Waiter align(cache_line) = .{},
         allocator: std.mem.Allocator,
 
         produced: if (builtin.mode == .Debug) std.atomic.Value(u64) else void =
@@ -140,8 +117,9 @@ pub fn RingBuffer(comptime T: type) type {
                         @branchHint(.likely);
                         slot.value = value;
                         @atomicStore(u64, &slot.sequence, head +% 1, .release);
+                        _ = @atomicRmw(u64, &self.epoch, .Add, 1, .release);
                         if (builtin.mode == .Debug) _ = self.produced.fetchAdd(1, .monotonic);
-                        self.consumer_waiter.notifyOne();
+                        self.waiter.notifyOne();
                         return;
                     }
                     continue;
@@ -156,12 +134,10 @@ pub fn RingBuffer(comptime T: type) type {
             }
         }
 
-        // Close the buffer for graceful shutdown.
-        // Sets shutdown flag and wakes all parked consumers so they can exit.
-        // Consumers will drain remaining items then return null.
         pub fn close(self: *Self) void {
             @atomicStore(bool, &self.shutdown, true, .release);
-            self.consumer_waiter.close();
+            _ = @atomicRmw(u64, &self.epoch, .Add, 1, .release);
+            self.waiter.broadcast();
         }
 
         // Try to consume a value (non-blocking).
@@ -195,17 +171,6 @@ pub fn RingBuffer(comptime T: type) type {
             return null;
         }
 
-        // Consume a value (blocking).
-        // Returns null only when the buffer is closed and empty.
-        //
-        // Three-phase wait strategy:
-        //   1. Fast path: try once, return immediately if successful
-        //   2. Spin phase: try 16 times with spin hints (good for short waits)
-        //   3. Park phase: sleep on condvar until producer signals
-        //
-        // This graduated approach optimizes for the common case (data available)
-        // while avoiding CPU waste during idle periods. The spin phase catches
-        // cases where a producer is just about to publish.
         pub fn consume(self: *Self) ?T {
             if (self.tryConsume()) |v| {
                 @branchHint(.likely);
@@ -223,10 +188,37 @@ pub fn RingBuffer(comptime T: type) type {
             }
 
             while (!@atomicLoad(bool, &self.shutdown, .acquire)) {
-                self.consumer_waiter.wait();
+                self.park();
                 if (self.tryConsume()) |v| return v;
             }
             return self.tryConsume();
+        }
+
+        // Epoch-based parking: prevents lost wakeups by checking if epoch changed
+        // since we decided to sleep. Even if signal is "lost", epoch changed so
+        // we won't actually sleep (or will immediately re-check).
+        fn park(self: *Self) void {
+            const e0 = @atomicLoad(u64, &self.epoch, .acquire);
+
+            self.waiter.mutex.lock();
+            defer self.waiter.mutex.unlock();
+
+            _ = @atomicRmw(u32, &self.waiter.parked_count, .Add, 1, .monotonic);
+            defer _ = @atomicRmw(u32, &self.waiter.parked_count, .Sub, 1, .monotonic);
+
+            while (true) {
+                if (@atomicLoad(bool, &self.shutdown, .acquire)) return;
+                if (self.peekReadable()) return;
+                if (@atomicLoad(u64, &self.epoch, .acquire) != e0) return;
+                self.waiter.cond.wait(&self.waiter.mutex);
+            }
+        }
+
+        fn peekReadable(self: *Self) bool {
+            const tail = @atomicLoad(u64, &self.tail, .monotonic);
+            const slot = &self.slots[tail & self.mask];
+            const seq = @atomicLoad(u64, &slot.sequence, .acquire);
+            return seq == tail +% 1;
         }
 
         pub fn checkInvariants(self: *Self) void {
