@@ -105,21 +105,18 @@ fn runLatencyBenchmark(allocator: std.mem.Allocator, num_producers: u32, num_con
 
     std.mem.sort(i128, latencies[0..num_samples], {}, std.sort.asc(i128));
 
-    const min_lat = latencies[0];
-    const p50 = latencies[num_samples / 2];
-    const p99 = latencies[(num_samples * 99) / 100];
-    const p999 = latencies[(num_samples * 999) / 1000];
-    const max_lat = latencies[num_samples - 1];
-
-    var sum: i128 = 0;
-    for (latencies[0..num_samples]) |l| sum += l;
-    const avg = @divTrunc(sum, num_samples);
+    const n: u64 = num_samples;
+    const p50 = latencies[@intCast(n / 2)];
+    const p99 = latencies[@intCast((n * 99) / 100)];
+    const p999 = latencies[@intCast((n * 999) / 1000)];
+    const p9999 = latencies[@intCast((n * 9999) / 10000)];
+    const p99999 = latencies[@intCast(@min((n * 99999) / 100000, n - 1))];
 
     const elapsed_ms = @divTrunc(end - start, 1_000_000);
-
-    std.debug.print("{d}P/{d}C ({d} samples, {d}ms total):\n", .{num_producers, num_consumers, num_samples, elapsed_ms});
-    std.debug.print("  min: {d}µs, avg: {d}µs, p50: {d}µs\n", .{@divTrunc(min_lat, 1000), @divTrunc(avg, 1000), @divTrunc(p50, 1000)});
-    std.debug.print("  p99: {d}µs, p99.9: {d}µs, max: {d}µs\n\n", .{@divTrunc(p99, 1000), @divTrunc(p999, 1000), @divTrunc(max_lat, 1000)});
+    std.debug.print("{d}P/{d}C ({d} samples, {d}ms):\n", .{num_producers, num_consumers, num_samples, elapsed_ms});
+    std.debug.print("  p50: {d}µs, p99: {d}µs, p99.9: {d}µs, p99.99: {d}µs, p99.999: {d}µs\n\n", .{
+        @divTrunc(p50, 1000), @divTrunc(p99, 1000), @divTrunc(p999, 1000), @divTrunc(p9999, 1000), @divTrunc(p99999, 1000)
+    });
 }
 
 fn latencyProducer(ring: *BenchRing, count: u32) void {
